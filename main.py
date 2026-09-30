@@ -1,7 +1,9 @@
 import argparse
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Literal
 
 import dotenv
@@ -23,6 +25,7 @@ from forecasting_tools import (
     GeneralLlm,
     MetaculusClient,
     MetaculusQuestion,
+    MonetaryCostManager,
     MultipleChoiceQuestion,
     NumericDistribution,
     NumericQuestion,
@@ -41,8 +44,25 @@ from forecasting_tools import (
     structure_output,
 )
 
+import litellm
+from forecasting_tools.ai_models.resource_managers.monetary_cost_manager import (
+    LitellmCostTracker,
+)
+
 dotenv.load_dotenv()
 logger = logging.getLogger(__name__)
+
+# forecasting-tools records each LLM call twice: GeneralLlm adds the cost itself
+# when litellm's success callback has not fired yet, and litellm's logging worker
+# fires that callback later anyway. Registering the callback once and removing
+# it leaves only GeneralLlm's direct count, so run costs and the cost limit are
+# exact.
+LitellmCostTracker.initialize_cost_tracking()
+litellm.callbacks[:] = [
+    callback
+    for callback in litellm.callbacks
+    if not isinstance(callback, LitellmCostTracker)
+]
 
 
 class SummerTemplateBot2026(ForecastBot):
@@ -646,6 +666,58 @@ class SummerTemplateBot2026(ForecastBot):
         )
 
 
+# Failure counts persist between scheduled runs through the GitHub Actions cache.
+FAILED_QUESTIONS_FILE = Path("failed_questions.json")
+MAX_FAILED_ATTEMPTS = 2
+# A run starts no new question once it has spent this much; the remaining
+# questions wait for the next scheduled run. MonetaryCostManager's own hard
+# limit is not used: litellm logs and ignores the error its pre-call hook raises.
+RUN_COST_LIMIT_USD = 2.0
+
+
+def forecast_new_questions(
+    bot: ForecastBot,
+    tournament_id: int | str,
+    failure_counts: dict[str, int],
+    run_cost: MonetaryCostManager,
+) -> list:
+    """
+    Forecast, one at a time, the open questions of a tournament that the bot
+    has not forecast yet, stopping once the run has spent RUN_COST_LIMIT_USD.
+    Questions that already failed MAX_FAILED_ATTEMPTS times are skipped, so a
+    persistent error cannot keep spending on every scheduled run.
+    """
+    questions = bot.metaculus_client.get_all_open_questions_from_tournament(
+        tournament_id
+    )
+    new_questions = [
+        question
+        for question in questions
+        if not question.already_forecasted
+        and failure_counts.get(str(question.id_of_question), 0) < MAX_FAILED_ATTEMPTS
+    ]
+    logger.info(
+        f"Tournament {tournament_id}: {len(questions)} open questions, "
+        f"{len(new_questions)} to forecast"
+    )
+    reports = []
+    for question in new_questions:
+        if run_cost.current_usage >= RUN_COST_LIMIT_USD:
+            logger.info(
+                f"Run cost limit reached (${run_cost.current_usage:.2f}); "
+                f"{len(new_questions) - len(reports)} questions left for the next run"
+            )
+            break
+        report = asyncio.run(
+            bot.forecast_questions([question], return_exceptions=True)
+        )[0]
+        reports.append(report)
+        if isinstance(report, BaseException):
+            key = str(question.id_of_question)
+            failure_counts[key] = failure_counts.get(key, 0) + 1
+    return reports
+
+
 if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
@@ -656,24 +728,27 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["tournament", "metaculus_cup", "test_questions"],
+        choices=["tournament", "minibench", "metaculus_cup", "test_questions"],
         default="tournament",
         help="What to forecast on (default: tournament)",
     )
     args = parser.parse_args()
-    run_mode: Literal["tournament", "metaculus_cup", "test_questions"] = args.mode
+    run_mode: Literal["tournament", "minibench", "metaculus_cup", "test_questions"] = (
+        args.mode
+    )
 
     check_environment(strict=True)
     publish_to_metaculus = True
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
 
-    # Configure the bot. Models are pinned for an OpenAI-only key: the
-    # researcher that forecasting-tools picks by default for OpenAI
-    # (gpt-4o-search-preview) has been retired, so research stays off until a
-    # search provider (AskNews, OpenRouter, Perplexity or Exa) is configured.
+    # Configure the bot. Models are pinned for an OpenAI-only key.
+    # gpt-6.1-sol with low reasoning effort and 3 predictions per question aims
+    # at about $0.10 per question. The researcher that forecasting-tools picks
+    # by default for OpenAI (gpt-4o-search-preview) has been retired, so
+    # research uses gpt-5-search-api.
     template_bot = SummerTemplateBot2026(
         research_reports_per_question=1,
-        predictions_per_research_report=5,
+        predictions_per_research_report=3,
         use_research_summary_to_forecast=False,
         publish_reports_to_metaculus=publish_to_metaculus,
         folder_to_save_reports_to=None,
@@ -681,13 +756,17 @@ if __name__ == "__main__":
         extra_metadata_in_explanation=True,
         llms={
             "default": GeneralLlm(
-                model="openai/gpt-4o",
-                temperature=0.3,
-                timeout=40,
+                model="openai/gpt-6.1-sol",
+                reasoning_effort="low",
+                timeout=180,
                 allowed_tries=2,
             ),
             "summarizer": "openai/gpt-4o-mini",
-            "researcher": "no_research",
+            "researcher": GeneralLlm(
+                model="openai/gpt-5-search-api",
+                timeout=120,
+                allowed_tries=2,
+            ),
             "parser": "openai/gpt-4o-mini",
         },
     )
@@ -702,63 +781,73 @@ if __name__ == "__main__":
     # need updating whenever the seasons rotate.
     TOURNAMENT_URLS = {
         "tournament": "https://www.metaculus.com/tournament/fall-futureeval-2026/",
+        "minibench": "https://www.metaculus.com/tournament/minibench/",
         "metaculus_cup": "https://www.metaculus.com/tournament/metaculus-cup-fall-2026/",
         "test_questions": "https://www.metaculus.com/tournament/bot-testing-area/",
     }
+
+    failure_counts: dict[str, int] = {}
+    if FAILED_QUESTIONS_FILE.exists():
+        failure_counts = json.loads(FAILED_QUESTIONS_FILE.read_text())
 
     # Dispatch on mode. Each branch produces a list of ForecastReport (or
     # exceptions, since return_exceptions=True) which then flows into the
     # summary printers below.
     client = MetaculusClient()
-    if run_mode == "tournament":
-        seasonal_tournament_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                FALL_2026_FUTUREEVAL_ID, return_exceptions=True
-            )
-        )
-        minibench_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                client.CURRENT_MINIBENCH_ID, return_exceptions=True
-            )
-        )
-        forecast_reports = seasonal_tournament_reports + minibench_reports
-    elif run_mode == "metaculus_cup":
-        # The Metaculus Cup may be uninitialized near the start of a season
-        # (Jan/May/Sep). AXC_2025_TOURNAMENT_ID = 32564 and
-        # AI_2027_TOURNAMENT_ID = "ai-2027" are also valid targets here.
-        template_bot.skip_previously_forecasted_questions = False
-        forecast_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                FALL_2026_METACULUS_CUP_ID, return_exceptions=True
-            )
-        )
-    elif run_mode == "test_questions":
-        # The bot-testing-area tournament contains all question types and is
-        # the recommended target for smoke-testing your bot.
-        # https://www.metaculus.com/tournament/bot-testing-area/
-        # To keep the smoke test cheap, only a few questions are forecast,
-        # preferring one of each question type.
-        template_bot.skip_previously_forecasted_questions = False
-        TEST_QUESTION_LIMIT = 3
-        open_test_questions = client.get_all_open_questions_from_tournament(
-            "bot-testing-area"
-        )
-        picked_questions = []
-        for question in open_test_questions:
-            if type(question) not in {type(q) for q in picked_questions}:
-                picked_questions.append(question)
-        for question in open_test_questions:
-            if question not in picked_questions:
-                picked_questions.append(question)
-        picked_questions = picked_questions[:TEST_QUESTION_LIMIT]
-        print(
-            f"Test mode: forecasting {len(picked_questions)} of "
-            f"{len(open_test_questions)} open questions "
-            f"({', '.join(type(q).__name__ for q in picked_questions)})"
-        )
-        forecast_reports = asyncio.run(
-            template_bot.forecast_questions(picked_questions, return_exceptions=True)
-        )
+    try:
+        # Without a hard limit the manager only tracks what this run spends.
+        with MonetaryCostManager() as run_cost:
+            if run_mode == "tournament":
+                forecast_reports = forecast_new_questions(
+                    template_bot, FALL_2026_FUTUREEVAL_ID, failure_counts, run_cost
+                ) + forecast_new_questions(
+                    template_bot, client.CURRENT_MINIBENCH_ID, failure_counts, run_cost
+                )
+            elif run_mode == "minibench":
+                forecast_reports = forecast_new_questions(
+                    template_bot, client.CURRENT_MINIBENCH_ID, failure_counts, run_cost
+                )
+            elif run_mode == "metaculus_cup":
+                # The Metaculus Cup may be uninitialized near the start of a season
+                # (Jan/May/Sep). AXC_2025_TOURNAMENT_ID = 32564 and
+                # AI_2027_TOURNAMENT_ID = "ai-2027" are also valid targets here.
+                template_bot.skip_previously_forecasted_questions = False
+                forecast_reports = asyncio.run(
+                    template_bot.forecast_on_tournament(
+                        FALL_2026_METACULUS_CUP_ID, return_exceptions=True
+                    )
+                )
+            elif run_mode == "test_questions":
+                # The bot-testing-area tournament contains all question types and is
+                # the recommended target for smoke-testing your bot.
+                # https://www.metaculus.com/tournament/bot-testing-area/
+                # To keep the smoke test cheap, only a few questions are forecast,
+                # preferring one of each question type.
+                template_bot.skip_previously_forecasted_questions = False
+                TEST_QUESTION_LIMIT = 3
+                open_test_questions = client.get_all_open_questions_from_tournament(
+                    "bot-testing-area"
+                )
+                picked_questions = []
+                for question in open_test_questions:
+                    if type(question) not in {type(q) for q in picked_questions}:
+                        picked_questions.append(question)
+                for question in open_test_questions:
+                    if question not in picked_questions:
+                        picked_questions.append(question)
+                picked_questions = picked_questions[:TEST_QUESTION_LIMIT]
+                print(
+                    f"Test mode: forecasting {len(picked_questions)} of "
+                    f"{len(open_test_questions)} open questions "
+                    f"({', '.join(type(q).__name__ for q in picked_questions)})"
+                )
+                forecast_reports = asyncio.run(
+                    template_bot.forecast_questions(
+                        picked_questions, return_exceptions=True
+                    )
+                )
+    finally:
+        FAILED_QUESTIONS_FILE.write_text(json.dumps(failure_counts, indent=2))
 
     template_bot.log_report_summary(forecast_reports)
     print_run_summary_banner(

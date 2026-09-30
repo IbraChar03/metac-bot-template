@@ -2,9 +2,9 @@ name: Forecast on new AI tournament questions
 
 on:
   workflow_dispatch:
-  # Paused until the improved bot is ready: uncomment to forecast every 20 min.
+  # Paused until the test with the new models passes: uncomment to forecast every 30 min.
   # schedule:
-  #   - cron: "7,27,47 * * * *" # every 20 min, offset off the hour. Make sure to skip already-forecasted questions!
+  #   - cron: "7,37 * * * *" # every 30 min, offset off the hour. Make sure to skip already-forecasted questions!
 
 # Add concurrency group to prevent parallel runs
 concurrency:
@@ -38,9 +38,18 @@ jobs:
       #     key: venv-${{ runner.os }}-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('**/poetry.lock') }}
       - name: Install dependencies
         run: poetry install --no-interaction --no-root
+      # Remembers which questions failed in earlier runs (FAILED_QUESTIONS_FILE in main.py).
+      - name: Restore failed question counts
+        uses: actions/cache/restore@v4
+        with:
+          path: failed_questions.json
+          key: failed-questions-${{ github.run_id }}
+          restore-keys: failed-questions-
+      # MiniBench only for now; switch to `main.py` (tournament mode) to add the
+      # Fall 2026 FutureEval tournament.
       - name: Run bot
         run: |
-          poetry run python main.py
+          poetry run python main.py --mode minibench
         # this reads the environment variables from the github repository.
         # Store under Settings --> Secrets and variables --> Actions
         env:
@@ -52,3 +61,10 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ASKNEWS_CLIENT_ID: ${{ secrets.ASKNEWS_CLIENT_ID }}
           ASKNEWS_SECRET: ${{ secrets.ASKNEWS_SECRET }}
+      # Saved even when some questions failed, since that is when the counts matter.
+      - name: Save failed question counts
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: failed_questions.json
+          key: failed-questions-${{ github.run_id }}

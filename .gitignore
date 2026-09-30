@@ -171,3 +171,7 @@ cython_debug/
 
 # MacOS
 .DS_Store
+
+# Local run state and virtualenv
+failed_questions.json
+.venv-local/
