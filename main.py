@@ -742,10 +742,11 @@ if __name__ == "__main__":
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
 
     # Configure the bot. Models are pinned for an OpenAI-only key.
-    # gpt-6.1-sol with low reasoning effort and 3 predictions per question aims
-    # at about $0.10 per question. The researcher that forecasting-tools picks
-    # by default for OpenAI (gpt-4o-search-preview) has been retired, so
-    # research uses gpt-5-search-api.
+    # gpt-6.1-sol with low reasoning effort and 3 predictions per question costs
+    # about $0.05 per question. The researcher that forecasting-tools picks by
+    # default for OpenAI (gpt-4o-search-preview) has been retired, so research
+    # uses gpt-5-search-api. A new OpenAI account allows it only 6,000 tokens per
+    # minute, hence the low search context and the extra retries (5-60 s apart).
     template_bot = SummerTemplateBot2026(
         research_reports_per_question=1,
         predictions_per_research_report=3,
@@ -759,13 +760,14 @@ if __name__ == "__main__":
                 model="openai/gpt-6.1-sol",
                 reasoning_effort="low",
                 timeout=180,
-                allowed_tries=2,
+                allowed_tries=3,
             ),
             "summarizer": "openai/gpt-4o-mini",
             "researcher": GeneralLlm(
                 model="openai/gpt-5-search-api",
+                web_search_options={"search_context_size": "low"},
                 timeout=120,
-                allowed_tries=2,
+                allowed_tries=4,
             ),
             "parser": "openai/gpt-4o-mini",
         },
@@ -841,11 +843,16 @@ if __name__ == "__main__":
                     f"{len(open_test_questions)} open questions "
                     f"({', '.join(type(q).__name__ for q in picked_questions)})"
                 )
-                forecast_reports = asyncio.run(
-                    template_bot.forecast_questions(
-                        picked_questions, return_exceptions=True
-                    )
-                )
+                # One question at a time, as in the scheduled runs, to stay
+                # within the account's tokens-per-minute limits.
+                forecast_reports = [
+                    asyncio.run(
+                        template_bot.forecast_questions(
+                            [question], return_exceptions=True
+                        )
+                    )[0]
+                    for question in picked_questions
+                ]
     finally:
         FAILED_QUESTIONS_FILE.write_text(json.dumps(failure_counts, indent=2))
 
