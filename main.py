@@ -667,9 +667,10 @@ if __name__ == "__main__":
     publish_to_metaculus = True
     print_startup_banner(run_mode, will_publish=publish_to_metaculus)
 
-    # Configure the bot. The `llms=` block below is commented out to use
-    # whichever default models forecasting-tools picks based on your env vars;
-    # uncomment and edit to pin specific models.
+    # Configure the bot. Models are pinned for an OpenAI-only key: the
+    # researcher that forecasting-tools picks by default for OpenAI
+    # (gpt-4o-search-preview) has been retired, so research stays off until a
+    # search provider (AskNews, OpenRouter, Perplexity or Exa) is configured.
     template_bot = SummerTemplateBot2026(
         research_reports_per_question=1,
         predictions_per_research_report=5,
@@ -678,17 +679,17 @@ if __name__ == "__main__":
         folder_to_save_reports_to=None,
         skip_previously_forecasted_questions=True,
         extra_metadata_in_explanation=True,
-        # llms={
-        #     "default": GeneralLlm(
-        #         model="openrouter/openai/gpt-4o",
-        #         temperature=0.3,
-        #         timeout=40,
-        #         allowed_tries=2,
-        #     ),
-        #     "summarizer": "openai/gpt-4o-mini",
-        #     "researcher": "asknews/news-summaries",
-        #     "parser": "openai/gpt-4o-mini",
-        # },
+        llms={
+            "default": GeneralLlm(
+                model="openai/gpt-4o",
+                temperature=0.3,
+                timeout=40,
+                allowed_tries=2,
+            ),
+            "summarizer": "openai/gpt-4o-mini",
+            "researcher": "no_research",
+            "parser": "openai/gpt-4o-mini",
+        },
     )
 
     # The pinned forecasting-tools 0.2.92 still points CURRENT_AI_COMPETITION_ID

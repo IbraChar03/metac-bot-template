@@ -35,6 +35,13 @@ jobs:
       #     key: venv-${{ runner.os }}-${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('**/poetry.lock') }}
       - name: Install dependencies
         run: poetry install --no-interaction --no-root
+      # Listing models is free; it shows which OpenAI models this key can use.
+      - name: List OpenAI models available to this key
+        continue-on-error: true
+        run: |
+          poetry run python -c "import openai; ids = sorted(m.id for m in openai.OpenAI().models.list()); print('\n'.join(i for i in ids if i.startswith(('gpt', 'o1', 'o3', 'o4', 'o5'))))"
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       - name: Run bot
         run: |
           poetry run python main.py --mode test_questions
