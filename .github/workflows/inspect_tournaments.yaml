@@ -1,0 +1,27 @@
+name: Inspect tournaments
+
+# Read-only: lists open and upcoming questions, no forecasts and no LLM calls.
+on:
+  workflow_dispatch:
+
+jobs:
+  inspect_job:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install poetry
+        uses: snok/install-poetry@v1
+        with:
+          virtualenvs-create: true
+          virtualenvs-in-project: true
+          installer-parallel: true
+      - name: Install dependencies
+        run: poetry install --no-interaction --no-root
+      - name: List open and upcoming questions
+        run: poetry run python inspect_tournaments.py
+        env:
+          METACULUS_TOKEN: ${{ secrets.METACULUS_TOKEN }}
