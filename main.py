@@ -735,11 +735,28 @@ if __name__ == "__main__":
         # The bot-testing-area tournament contains all question types and is
         # the recommended target for smoke-testing your bot.
         # https://www.metaculus.com/tournament/bot-testing-area/
+        # To keep the smoke test cheap, only a few questions are forecast,
+        # preferring one of each question type.
         template_bot.skip_previously_forecasted_questions = False
+        TEST_QUESTION_LIMIT = 3
+        open_test_questions = client.get_all_open_questions_from_tournament(
+            "bot-testing-area"
+        )
+        picked_questions = []
+        for question in open_test_questions:
+            if type(question) not in {type(q) for q in picked_questions}:
+                picked_questions.append(question)
+        for question in open_test_questions:
+            if question not in picked_questions:
+                picked_questions.append(question)
+        picked_questions = picked_questions[:TEST_QUESTION_LIMIT]
+        print(
+            f"Test mode: forecasting {len(picked_questions)} of "
+            f"{len(open_test_questions)} open questions "
+            f"({', '.join(type(q).__name__ for q in picked_questions)})"
+        )
         forecast_reports = asyncio.run(
-            template_bot.forecast_on_tournament(
-                "bot-testing-area", return_exceptions=True
-            )
+            template_bot.forecast_questions(picked_questions, return_exceptions=True)
         )
 
     template_bot.log_report_summary(forecast_reports)
