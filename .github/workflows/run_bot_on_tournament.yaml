@@ -44,11 +44,10 @@ jobs:
           path: failed_questions.json
           key: failed-questions-${{ github.run_id }}
           restore-keys: failed-questions-
-      # MiniBench only for now; switch to `main.py` (tournament mode) to add the
-      # Fall 2026 FutureEval tournament.
+      # Tournament mode: the Fall 2026 FutureEval tournament and MiniBench.
       - name: Run bot
         run: |
-          poetry run python main.py --mode minibench
+          poetry run python main.py --mode tournament
         # this reads the environment variables from the github repository.
         # Store under Settings --> Secrets and variables --> Actions
         env:
